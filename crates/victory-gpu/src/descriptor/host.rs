@@ -3393,25 +3393,25 @@ mod tests {
         for i in 0..4u32 {
             q.written(20 + i, 1, 0, false);
         }
-        let due = q.due(1, 100);
+        let (due, _) = q.due(1, 100);
         assert_eq!(due.len(), 4);
         // The card is full: slots 20 and 21 are held back until frame 101.
         for &(index, write) in due.iter().filter(|d| d.0 < 22) {
             q.hold(index, write, 101);
         }
-        let now: Vec<u32> = q.due(2, 100).into_iter().map(|d| d.0).collect();
+        let now: Vec<u32> = q.due(2, 100).0.into_iter().map(|d| d.0).collect();
         assert!(!now.contains(&20) && !now.contains(&21));
         assert!(now.contains(&22) && now.contains(&23));
-        assert_eq!(q.census(2)[2], 0, "held slots do not wait for their memory");
+        assert_eq!(q.due(2, 0).1[2], 0, "held slots do not wait for their memory");
         // Due again at their frame, in the order they had.
-        assert_eq!(q.due(101, 100), due);
+        assert_eq!(q.due(101, 100).0, due);
         // Slot 21 is written again while held: due as written.
         q.written(21, 3, 0, false);
-        assert!(q.due(3, 100).iter().any(|d| d.0 == 21));
+        assert!(q.due(3, 100).0.iter().any(|d| d.0 == 21));
         // Room again at frame 5: slot 20 is due at once, and only it was
         // still held as it was.
         assert_eq!(q.room(5), 1);
-        assert!(q.due(5, 100).iter().any(|d| d.0 == 20));
+        assert!(q.due(5, 100).0.iter().any(|d| d.0 == 20));
         assert_eq!(q.room(6), 0);
     }
 
