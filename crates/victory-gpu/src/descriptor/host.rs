@@ -3422,7 +3422,7 @@ mod tests {
             let q = due_fixture(73, repeat_every);
             for frame in [0, 1] {
                 for max in 0..=75 {
-                    assert_eq!(q.due(frame, max), due_full_sort(&q, frame, max));
+                    assert_eq!(q.due(frame, max).0, due_full_sort(&q, frame, max));
                 }
             }
         }
@@ -3436,7 +3436,7 @@ mod tests {
 
         for repeat_every in [2, 17] {
             let q = due_fixture(40_000, repeat_every);
-            assert_eq!(q.due(1, 4096), due_full_sort(&q, 1, 4096));
+            assert_eq!(q.due(1, 4096).0, due_full_sort(&q, 1, 4096));
             let mut samples = [Vec::new(), Vec::new()];
             for _ in 0..15 {
                 for (i, elapsed) in samples.iter_mut().enumerate() {
@@ -3444,7 +3444,7 @@ mod tests {
                     let order = if i == 0 {
                         due_full_sort(black_box(&q), 1, 4096)
                     } else {
-                        black_box(&q).due(1, 4096)
+                        black_box(&q).due(1, 4096).0
                     };
                     black_box(order);
                     elapsed.push(began.elapsed());
