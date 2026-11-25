@@ -500,6 +500,27 @@ impl Module {
         self.blocks[block].term = Some(t);
     }
 
+    /// Every `ret` becomes a branch to one block that returns, as DXC
+    /// emits a function. dxil-spirv (vkd3d-proton, so Wine and Proton)
+    /// structures a second `ret` that leaves a loop (the iteration
+    /// limit's exit, a lane ending inside the loop) into a loop around the
+    /// whole function whose merge block it leaves without a terminator;
+    /// NVIDIA's Linux driver then crashes in `vkCreateComputePipelines`
+    /// (2026-11-25, Wine 11.22, vkd3d-proton 2.x, driver 620.70).
+    pub fn one_return(&mut self) {
+        let rets: Vec<usize> = (0..self.blocks.len())
+            .filter(|&b| matches!(self.blocks[b].term, Some(Term::Ret)))
+            .collect();
+        if rets.len() < 2 {
+            return;
+        }
+        let exit = self.new_block();
+        self.blocks[exit].term = Some(Term::Ret);
+        for b in rets {
+            self.blocks[b].term = Some(Term::Br(exit));
+        }
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)
@@ -1194,6 +1215,32 @@ mod tests {
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
+    }
+
+    /// A loop left both by its exit and by a `ret` of its own (the
+    /// iteration limit's abort block) returns through one block.
+    #[test]
+    fn returns_become_one_exit() {
+        let mut m = Module::default();
+        let (entry, head, abort, exit) =
+            (m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        let c = m.bool(true);
+        m.terminate(entry, Term::Br(head));
+        m.terminate(head, Term::CondBr(c, exit, abort));
+        m.terminate(abort, Term::Ret);
+        m.terminate(exit, Term::Ret);
+        m.one_return();
+        let rets: Vec<usize> = (0..m.blocks.len())
+            .filter(|&b| matches!(m.blocks[b].term, Some(Term::Ret)))
+            .collect();
+        assert_eq!(rets.len(), 1);
+        let one = rets[0];
+        assert!(matches!(m.blocks[abort].term, Some(Term::Br(t)) if t == one));
+        assert!(matches!(m.blocks[exit].term, Some(Term::Br(t)) if t == one));
+        // A single return is left as it is.
+        let before = m.blocks.len();
+        m.one_return();
+        assert_eq!(m.blocks.len(), before);
     }
 
     #[test]
