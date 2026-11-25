@@ -1105,6 +1105,9 @@ struct Resource {
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
+    /// 1, or 2 where the texture was made at half size
+    /// (`VICTORY_RENDER_SCALE`): its views, viewports and present follow.
+    scale: u32,
     /// Textures also live on the host GPU (decision 0007); buffers do not
     /// yet. With, for a depth texture the title also writes as unordered
     /// access, the colour texture shaders write instead ([`Twin`]).
@@ -2264,6 +2267,7 @@ fn resource<'a>(this: This) -> &'a Resource {
 #[allow(clippy::too_many_arguments)]
 fn hand_out_resource(
     desc: ResourceDesc,
+    scale: u32,
     heap: HeapProperties,
     heap_flags: u32,
     backing: Backing,
@@ -2280,6 +2284,7 @@ fn hand_out_resource(
         heap,
         heap_flags,
         backing,
+        scale,
         #[cfg(windows)]
         host: Hosted {
             made: std::sync::Mutex::new(None),
@@ -2373,6 +2378,37 @@ impl Drop for Resource {
     }
 }
 
+/// The size factor a texture is made at: `VICTORY_RENDER_SCALE=2` halves the
+/// HDR targets (formats 10 and 42), so every 3D pass costs a quarter of the
+/// pixels and the present follows the smaller texture. 8-bit targets stay full
+/// size: the overlays and letterbox are laid out in their own pixels.
+fn render_scale(d: &ResourceDesc) -> u32 {
+    static WANT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    const HDR: [u32; 2] = [10, 42];
+    let want = *WANT.get_or_init(|| {
+        std::env::var("VICTORY_RENDER_SCALE").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(1)
+    });
+    const TARGET_OR_DEPTH: u32 = 1 | 2;
+    const EIGHT_BIT: [u32; 6] = [28, 29, 87, 88, 91, 93];
+    // HDR targets always; the 8-bit full-frame one too (the final frame the
+    // present copies), so the output shrinks - the stretch pass scales it.
+    let halve = HDR.contains(&d.format);
+    if want == 2 && d.dimension != BUFFER && d.flags & TARGET_OR_DEPTH != 0 && halve {
+        2
+    } else {
+        1
+    }
+}
+
+/// The size factor of a title texture (see [`render_scale`]).
+#[cfg(windows)]
+pub(crate) fn scale_of(this: This) -> u32 {
+    if this.is_null() {
+        return 1;
+    }
+    resource(this).scale
+}
+
 pub(crate) extern "system" fn create_committed(
     _: This,
     heap: *const HeapProperties,
@@ -2387,6 +2423,13 @@ pub(crate) extern "system" fn create_committed(
     let (Some(&heap), Some(&desc)) = (unsafe { (heap.as_ref(), desc.as_ref()) }) else {
         return E_INVALIDARG;
     };
+    let scale = render_scale(&desc);
+    let mut owned = desc;
+    if scale == 2 {
+        owned.width = (desc.width / 2).max(1);
+        owned.height = (desc.height / 2).max(1);
+    }
+    let desc = owned;
     let Some(info) = footprint(&desc) else {
         tracing::warn!(?desc, "no size for this resource");
         return E_INVALIDARG;
@@ -2403,6 +2446,7 @@ pub(crate) extern "system" fn create_committed(
     };
     hand_out_resource(
         desc,
+        scale,
         heap,
         heap_flags,
         Backing::Committed(memory),
@@ -2513,8 +2557,12 @@ pub(crate) extern "system" fn create_at_address(
         creation_nodes: 1,
         visible_nodes: 1,
     };
+    // At an address: kept at the title's own size for now (halving it here
+    // brought the stair-step and removals back).
+    let scale = 1;
     hand_out_resource(
         desc,
+        scale,
         DEFAULT,
         0,
         Backing::Address(address as *mut u8),
@@ -2683,6 +2731,7 @@ pub(crate) extern "system" fn create_placed(
     let backing = Backing::Placed { heap, offset };
     hand_out_resource(
         desc,
+        1,
         h.desc.properties,
         h.desc.flags,
         backing,

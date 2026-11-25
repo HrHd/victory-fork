@@ -644,15 +644,46 @@ impl State {
         };
     }
 
+    /// The size factor of this draw's targets (`resource::scale`).
+    fn target_scale(&self) -> u32 {
+        self.targets
+            .first()
+            .map(|&at| crate::resource::scale_of(at as crate::object::This))
+            .unwrap_or(1)
+    }
+
     /// Viewports, scissors, the blend factor and the stencil reference: set
     /// on the host list at once, and kept for [`State::replay`].
     pub(crate) fn set_viewports(&mut self, list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+        let f = self.target_scale() as f32;
+        let scaled: Vec<D3D12_VIEWPORT> = viewports
+            .iter()
+            .map(|v| D3D12_VIEWPORT {
+                TopLeftX: v.TopLeftX / f,
+                TopLeftY: v.TopLeftY / f,
+                Width: v.Width / f,
+                Height: v.Height / f,
+                MinDepth: v.MinDepth,
+                MaxDepth: v.MaxDepth,
+            })
+            .collect();
         self.viewports.clear();
-        self.viewports.extend_from_slice(viewports);
-        crate::draw::viewports(list, viewports);
+        self.viewports.extend_from_slice(&scaled);
+        crate::draw::viewports(list, &scaled);
     }
 
     pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
+        let s = self.target_scale() as i32;
+        let scaled: Vec<RECT> = rects
+            .iter()
+            .map(|r| RECT {
+                left: r.left / s,
+                top: r.top / s,
+                right: r.right / s,
+                bottom: r.bottom / s,
+            })
+            .collect();
+        let rects = scaled.as_slice();
         self.scissors.clear();
         self.scissors.extend_from_slice(rects);
         if scissor_test() {
