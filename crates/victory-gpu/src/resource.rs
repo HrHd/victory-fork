@@ -2166,12 +2166,12 @@ pub(crate) fn host_tiled(this: This) -> Option<OnDemand> {
     hosted(this, false).map(|(host, _)| host).filter(|host| host.tiled.is_some()).map(OnDemand)
 }
 
-/// The levels a view of title texture `this` may show, if its host
+/// The first level a view of title texture `this` may show, if its host
 /// copy is made level by level and some level is held and has memory
-/// (`crate::tiles::Tiled::shown_levels`).
+/// (`crate::tiles::Tiled::first_shown`).
 #[cfg(windows)]
-pub(crate) fn shown_levels(this: This) -> u32 {
-    host_tiled(this).and_then(|host| host.tiled().map(|tiles| tiles.shown_levels())).unwrap_or(0)
+pub(crate) fn first_shown(this: This) -> Option<u32> {
+    host_tiled(this)?.tiled()?.first_shown()
 }
 
 /// A host copy made without memory of its own (`crate::tiles`), as a
