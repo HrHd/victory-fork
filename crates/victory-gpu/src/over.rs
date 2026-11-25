@@ -324,10 +324,11 @@ pub(crate) fn record_stretch(
 ) -> bool {
     // SAFETY: live resources.
     let (to, from) = unsafe { (target.GetDesc(), source.GetDesc()) };
-    if to.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0
-        || to.Width == 0
-        || from.Width == 0
-    {
+    // The target is drawn through a render-target view, so a swap chain buffer
+    // (no unordered-access flag) is as usable as a plane here.
+    let drawable = to.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0
+        || to.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0;
+    if !drawable || to.Width == 0 || from.Width == 0 {
         return false;
     }
     let mut made = STRETCHER.lock().unwrap_or_else(|e| e.into_inner());

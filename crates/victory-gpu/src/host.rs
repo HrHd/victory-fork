@@ -6209,15 +6209,46 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
+            // A halved title frame has another size than the back buffer: draw it
+            // across ([`crate::over::record_stretch`]) instead of copying, which
+            // needs equal sizes. Falls back to the copy when the stretch cannot
+            // be made (a back buffer without unordered access).
+            let mismatch = (desc.Width as u32, desc.Height) != (p.width, p.height);
+            let mut stretched = false;
+            if mismatch {
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    ),
+                ]);
+                stretched = crate::over::record_stretch(
+                    &self.device,
+                    list,
                     &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+                    texture,
+                    [p.width, p.height],
+                );
+                if !stretched {
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                }
+            } else {
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                ]);
+                list.CopyResource(&back, texture);
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))

@@ -2392,8 +2392,12 @@ fn render_scale(d: &ResourceDesc) -> u32 {
     const EIGHT_BIT: [u32; 6] = [28, 29, 87, 88, 91, 93];
     // HDR targets always; the 8-bit full-frame one too (the final frame the
     // present copies), so the output shrinks - the stretch pass scales it.
+    // 8-bit full-frame targets stay full size: halving them tints and dims the
+    // frame, and with equal sizes the present never takes the stretch path.
     let halve = HDR.contains(&d.format);
-    if want == 2 && d.dimension != BUFFER && d.flags & TARGET_OR_DEPTH != 0 && halve {
+    // Only the full-frame HDR targets: the 1440p passes keep their detail, so the
+    // upscale blocks stay off the mid-size effects.
+    if want == 2 && d.dimension != BUFFER && d.flags & TARGET_OR_DEPTH != 0 && halve && d.width >= 3840 {
         2
     } else {
         1
@@ -2559,7 +2563,13 @@ pub(crate) extern "system" fn create_at_address(
     };
     // At an address: kept at the title's own size for now (halving it here
     // brought the stair-step and removals back).
-    let scale = 1;
+    let scale = render_scale(&desc);
+    let mut owned = desc;
+    if scale == 2 {
+        owned.width = (desc.width / 2).max(1);
+        owned.height = (desc.height / 2).max(1);
+    }
+    let desc = owned;
     hand_out_resource(
         desc,
         scale,
