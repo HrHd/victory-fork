@@ -11011,8 +11011,15 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
+                // Each loop leaves for the abort block through a block of
+                // its own, a dedicated exit as DXC emits them: dxil-spirv
+                // (vkd3d-proton under Wine) mis-structures several loops
+                // that exit into one shared block (merge blocks claimed by
+                // several headers; NVIDIA's driver crashed on the result).
                 let abort = self.abort_block();
-                Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                let via = self.s.m.new_block();
+                self.s.m.terminate(via, Term::Br(abort));
+                Term::CondBr(ok, self.block[t].expect("reachable"), via)
             }
             LaneExit::Jump(t) => {
                 self.enter_loop(b, t, self.cur);
