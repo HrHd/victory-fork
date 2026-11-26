@@ -63,6 +63,8 @@ mod queue2;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+mod residency;
+#[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;

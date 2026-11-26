@@ -2165,7 +2165,12 @@ impl HostHeap {
                         self.keep(index, kept);
                     }
                     Make::None => {
-                        made[index as usize] = key;
+                        // A texture the card had no memory for: the slot is
+                        // not noted as made from this record, so the next
+                        // ask makes it again (marked, it kept its null view
+                        // for good, avatarmanz/VIctory-7900XTX#256).
+                        let retry = matches!(view, View::Shader(resource, _) if crate::resource::retrying(resource as crate::object::This));
+                        made[index as usize] = if retry { 0 } else { key };
                         if !self.sampler {
                             null_for(&view, self.cpu(index));
                         }
