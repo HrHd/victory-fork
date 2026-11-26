@@ -350,6 +350,32 @@ impl Drop for State {
     }
 }
 
+/// With `VICTORY_ZONE_LIMIT=<n>`: only the first n commands of a frame run,
+/// so the cost of a draw count can be isolated on one scene
+/// (`D:\Vi\AREA-ISOLATION.md`). Off by default.
+static ZONE_RUN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static ZONE_LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+fn zone_limit() -> u32 {
+    *ZONE_LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_ZONE_LIMIT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// The frame begins: the count starts again (called at the present).
+pub(crate) fn zone_reset() {
+    ZONE_RUN.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether this command is past the zone limit.
+fn zone_over() -> bool {
+    let limit = zone_limit();
+    limit != 0 && ZONE_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= limit
+}
+
 impl State {
     /// The list's submission has run (submissions are waited for): the
     /// dynamic slots its tables were made in are given back, not kept
@@ -2249,6 +2275,9 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        if zone_over() {
+            return;
+        }
         // It may write the arguments a window holds clamped.
         self.flush_merged(list);
 self.window = None;
@@ -2597,6 +2626,9 @@ self.window = None;
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        if zone_over() {
+            return;
+        }
         self.flush_merged(list);
 self.window = None;
         if self.may_store() {
@@ -3045,6 +3077,9 @@ self.window = None;
         first: u32,
         first_instance: u32,
     ) {
+        if zone_over() {
+            return;
+        }
         self.flush_merged(list);
         self.window = None;
         if self.may_store() {
@@ -3154,6 +3189,9 @@ self.window = None;
         base: i32,
         first_instance: u32,
     ) {
+        if zone_over() {
+            return;
+        }
         self.flush_merged(list);
         self.window = None;
         if self.may_store() {
@@ -3200,6 +3238,9 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        if zone_over() {
+            return false;
+        }
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
