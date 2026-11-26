@@ -7,6 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
+#[cfg(windows)]
+mod behind;
+
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
         0x0ec870a6,
@@ -1674,4 +1677,40 @@ mod tests {
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
     }
+}
+
+
+#[cfg(windows)]
+pub(crate) fn line_on() -> bool {
+    behind::on()
+}
+
+#[cfg(windows)]
+pub(crate) fn line_moved() {
+    behind::wake();
+}
+
+#[cfg(windows)]
+pub(crate) fn no_drain_here() {
+    behind::no_drain_here();
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) struct Shown {
+    frame: u64,
+    resource: usize,
+}
+
+/// Shows `texture`, in host state `state`, in our window.
+#[cfg(windows)]
+pub(crate) fn show(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32, what: Shown) {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let shown = host.present(texture, state, what.frame);
+    #[cfg(feature = "diagnostics")]
+    blinks(what.frame, what.resource as This, state, shown);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (shown, what.resource);
 }

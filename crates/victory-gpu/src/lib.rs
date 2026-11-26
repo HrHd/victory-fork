@@ -59,6 +59,12 @@ mod profile;
 pub mod query;
 pub mod queue;
 #[cfg(windows)]
+mod cores;
+#[cfg(windows)]
+mod ab;
+#[cfg(windows)]
+mod timeline;
+#[cfg(windows)]
 mod queue2;
 pub mod resource;
 pub mod root;

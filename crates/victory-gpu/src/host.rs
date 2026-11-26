@@ -8,6 +8,10 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(windows)]
+mod stamps;
+pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
+
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -9238,5 +9242,72 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+}
+
+pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
+    if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_)))) {
+        return false;
+    }
+    let ahead: Vec<&HostList> = ahead.collect();
+    let mut written: Vec<(usize, usize)> = declared_writes(&ahead).into_iter().flat_map(|(_, ranges)| ranges).collect();
+    for list in &ahead {
+        let deferred = list.deferred();
+        written.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
+        written.extend(deferred.backs.iter().map(|&(_, at, [row, rows, pitch])| (at, at + rows.saturating_sub(1) * pitch + row)));
+    }
+    let mut joined = Vec::new();
+    join_ranges(&mut joined, written);
+    blocked_by(&joined, next, false).is_none()
+}
+pub(crate) fn joins() -> (usize, usize) {
+    if ahead_of_writes() { joins_asked() } else { (1, 1) }
+}
+pub(crate) fn joins_asked() -> (usize, usize) {
+    static MOST: OnceLock<(usize, usize)> = OnceLock::new();
+    let of = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok());
+    let (parts, lists) = *MOST.get_or_init(|| (of("VICTORY_JOIN_PARTS").unwrap_or(1).max(1), of("VICTORY_JOIN_LISTS").unwrap_or(48).max(1)));
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_JOIN_PARTS") {
+        return (if on { 8 } else { 1 }, lists);
+    }
+    (parts, lists)
+}
+pub(crate) fn will_meet(list: &HostList, wait: &crate::list::ValueWait) -> bool {
+    let (address, bytes) = wait.place();
+    // The last write there says.
+    let deferred = list.deferred();
+    let last = deferred.writes.iter().rev().find(|(at, _, n)| *at < address + bytes && address < *at + *n);
+    matches!(last, Some((at, crate::queue::Written::Value(v), n)) if *at == address && *n >= bytes && wait.holds_for(*v))
+}
+
+fn ahead_of_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_AHEAD").is_none_or(|v| v != "0") && wide_refresh() && crate::watch::light())
+}
+
+impl Host {
+    pub(crate) fn execute_parts(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>, parts: &[usize]) {
+        if order.is_empty() {
+            crate::list::recycle(lists, &order);
+            return;
+        }
+        late_threads();
+        if let Some(cut) = {
+            let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+            card_steps::cut_for(&runs)
+        } {
+            match split(lists, order, cut) {
+                Ok([(lists, order), (more, behind)]) => {
+                    let first: Vec<usize> = parts.iter().copied().filter(|&p| p < cut).collect();
+                    let second: Vec<usize> = parts.iter().filter(|&&p| p > cut).map(|p| p - cut).collect();
+                    self.execute_parts(lists, order, &first);
+                    self.execute_parts(more, behind, &second);
+                }
+                Err((lists, order)) => self.send_late(lists, order, parts),
+            }
+            return;
+        }
+        self.send_late(lists, order, parts);
     }
 }

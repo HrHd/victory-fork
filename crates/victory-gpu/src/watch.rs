@@ -1785,3 +1785,8 @@ mod mapping_tests {
         assert!(read.load(Ordering::SeqCst));
     }
 }
+
+pub(crate) fn light() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIGHT_REFRESH").is_none_or(|v| v != "0"))
+}
