@@ -43,10 +43,12 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
         out.extend(sgd5::records(data).map(Source::Packed));
     }
     let raw = memchr::memmem::find_iter(data, b"DXBC")
-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
-            offset,
-            data: &data[offset..],
+        .filter_map(|offset| {
+            let container = Container::parse(&data[offset..]).ok()?;
+            Some(Source::Raw {
+                offset,
+                data: container.as_bytes(),
+            })
         });
     out.extend(raw);
     out
@@ -224,4 +226,29 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
         None => format!("<{:?} {:#x}>", i.encoding, i.opcode),
     };
     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identical_embedded_containers_have_the_same_bytes() {
+        let mut container = [0; 32];
+        container[..4].copy_from_slice(b"DXBC");
+        container[0x14] = 1;
+        container[0x18] = 32;
+        let mut file = b"prefix".to_vec();
+        file.extend_from_slice(&container);
+        file.extend_from_slice(b"padding");
+        file.extend_from_slice(&container);
+        file.extend_from_slice(b"trailer");
+
+        let found = sources(&file);
+
+        assert_eq!(found.len(), 2);
+        for source in found {
+            assert_eq!(source.bytes().unwrap().as_ref(), &container);
+        }
+    }
 }

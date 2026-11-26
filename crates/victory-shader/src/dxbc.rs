@@ -56,6 +56,7 @@ pub struct Part<'a> {
 
 #[derive(Debug, Clone)]
 pub struct Container<'a> {
+    bytes: &'a [u8],
     pub digest: [u8; 16],
     pub version: (u16, u16),
     pub parts: Vec<Part<'a>>,
@@ -100,10 +101,16 @@ impl<'a> Container<'a> {
             });
         }
         Ok(Container {
+            bytes: data,
             digest,
             version,
             parts,
         })
+    }
+
+    /// The declared container bytes, excluding anything after it.
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
     }
 
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
