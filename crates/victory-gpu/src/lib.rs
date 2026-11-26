@@ -61,6 +61,14 @@ pub mod queue;
 #[cfg(windows)]
 mod cores;
 #[cfg(windows)]
+mod land;
+#[cfg(windows)]
+mod safecopy;
+#[cfg(windows)]
+mod upload;
+#[cfg(windows)]
+mod switch;
+#[cfg(windows)]
 mod ab;
 #[cfg(windows)]
 mod timeline;

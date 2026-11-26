@@ -11,6 +11,7 @@ use std::sync::{Mutex, OnceLock};
 #[cfg(windows)]
 mod stamps;
 mod card_steps;
+mod place;
 pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};

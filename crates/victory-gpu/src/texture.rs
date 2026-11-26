@@ -1612,3 +1612,10 @@ mod title_memory_tests {
         }
     }
 }
+
+pub(crate) fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    REFRESH_WAITS[slot].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    out
+}

@@ -2355,8 +2355,12 @@ mod tests {
     }
 }
 
+#[cfg(windows)]
+use crate::upload::Upload;
+
+/// The memory of [llocate_upload] where no host GPU reads it by address.
 #[cfg(not(windows))]
-struct Upload(Vec<u8>);
+pub(crate) struct Upload(Vec<u8>);
 
 #[cfg(not(windows))]
 impl Upload {

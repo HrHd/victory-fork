@@ -1804,3 +1804,126 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
     (at / BLOCK..=(at + len - 1) / BLOCK)
         .all(|b| !g.clean.contains(b) && !g.absent.contains(b) && !g.protected.contains(b))
 }
+
+pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, Vec<(usize, u64)>) {
+    let mut before = Vec::with_capacity(spans.len());
+    let noted;
+    // The same pages at other addresses: copies of the memory there have not
+    // what was put in either.
+    let elsewhere: Vec<(usize, Vec<usize>)> = spans.iter().flat_map(|&(at, len)| elsewhere(at, len)).collect();
+    {
+        let frame = crate::frame::current();
+        for &page in pages {
+            LANDED.note(page, frame);
+        }
+        for (block, others) in &elsewhere {
+            let first = block / KERNEL_PAGE;
+            for &page in pages.iter().filter(|&&page| (first..first + BLOCK / KERNEL_PAGE).contains(&page)) {
+                others.iter().for_each(|other| LANDED.note(page - first + other / KERNEL_PAGE, frame));
+            }
+        }
+    }
+    {
+        let mut j = journal_mut();
+        let now = next_asking();
+        noted = now;
+        let mut blocks: Vec<(usize, u16)> = Vec::with_capacity(spans.len());
+        for &page in pages {
+            let (block, part) = (page / PARTS, 1u16 << (page % PARTS));
+            match blocks.last_mut() {
+                Some((last, parts)) if *last == block => *parts |= part,
+                _ => blocks.push((block, part)),
+            }
+        }
+        for (block, parts) in blocks {
+            before.push((block, j.note(block, parts, now)));
+        }
+        for (_, others) in &elsewhere {
+            for other in others {
+                j.note(other / PAGE, WHOLE, now);
+            }
+        }
+    }
+    for &(at, len) in spans {
+        // A placed texture there changes with no descriptor written.
+        crate::descriptor::host::remapped(at, len);
+    }
+    for other in elsewhere.into_iter().flat_map(|(_, others)| others) {
+        crate::descriptor::host::remapped(other, BLOCK);
+    }
+    (noted, before)
+}
+
+pub(crate) fn landing(at: usize, len: usize) {
+    {
+        let frame = crate::frame::current();
+        let (first, last) = (at / KERNEL_PAGE, (at + len.max(1) - 1) / KERNEL_PAGE);
+        (first..=last).for_each(|page| LANDED.note(page, frame));
+        for (block, others) in elsewhere(at, len) {
+            let block = block / KERNEL_PAGE;
+            let here = first.max(block)..=last.min(block + BLOCK / KERNEL_PAGE - 1);
+            for other in others {
+                here.clone().for_each(|page| LANDED.note(page - block + other / KERNEL_PAGE, frame));
+            }
+        }
+    }
+    writing(at, len);
+}
+
+pub(crate) fn changes() -> u64 {
+    CHANGES.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub(crate) fn again_after_change(since: u64, mut f: impl FnMut() -> bool) -> bool {
+    let mut since = since;
+    for _ in 0..4 {
+        let now = change_done();
+        if now == since {
+            return false;
+        }
+        since = now;
+        if f() {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn elsewhere(at: usize, len: usize) -> Vec<(usize, Vec<usize>)> {
+    if !view_guard() || len == 0 {
+        return Vec::new();
+    }
+    crate::inplace::shown_elsewhere(at / BLOCK * BLOCK, at.saturating_add(len))
+}
+
+pub(crate) fn journal_mut() -> std::sync::RwLockWriteGuard<'static, Journal> {
+    if let Ok(j) = JOURNAL.try_write() {
+        return j;
+    }
+    waited(2, || JOURNAL.write().unwrap_or_else(|e| e.into_inner()))
+}
+
+pub(crate) fn next_asking() -> u64 {
+    ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+pub(crate) fn change_done() -> u64 {
+    let mut tries = 0;
+    let mut started = None;
+    loop {
+        let now = changes();
+        if now.is_multiple_of(2) {
+            return now;
+        }
+        tries += 1;
+        if tries < 100 {
+            std::hint::spin_loop();
+            continue;
+        }
+        if started.get_or_insert_with(std::time::Instant::now).elapsed().as_secs() >= 1 {
+            return now;
+        }
+        // SAFETY: gives the processor to another thread.
+        unsafe { windows_sys::Win32::System::Threading::Sleep(u32::from(tries > 200)) };
+    }
+}
