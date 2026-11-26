@@ -382,3 +382,12 @@ mod tests {
         assert_eq!(guid_text(&g), "189819f1-1db6-4b57-be54-1821339b85f7");
     }
 }
+
+/// Adds a reference to an object that has one; false if it has none any
+/// more (its last one is being released).
+#[cfg(windows)]
+pub(crate) fn add_ref_alive(this: This) -> bool {
+    // SAFETY: `this` is one of our objects, not freed yet.
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n > 0).then(|| n + 1)).is_ok()
+}
