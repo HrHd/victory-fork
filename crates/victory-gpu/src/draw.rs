@@ -207,6 +207,7 @@ struct Merged {
     /// The user data it was begun with.
     user: Vec<u32>,
     tables: Vec<(u8, u32)>,
+    used: Vec<UsedResource>,
     /// The window it belongs to, by its base offset: a new window clamps
     /// into the scratch again and may overwrite what is pending.
     base: u64,
@@ -262,6 +263,9 @@ pub(crate) struct State {
     /// The view tables the last `prepare` made, by view and host slot: two
     /// draws that made the same ones can share a command.
     last_tables: Vec<(u8, u32)>,
+    /// The descriptor ranges those tables were made from (with [`heaps`],
+    /// what their contents are), in stage order.
+    last_used: Vec<UsedResource>,
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
@@ -935,6 +939,7 @@ impl State {
         if merge_runs() {
             self.last_tables.clear();
             self.last_user.clear();
+            self.last_used.clear();
         }
         self.prepare_for(list, indexed, false)
     }
@@ -1093,6 +1098,9 @@ impl State {
             let t = stage.translated();
             STORES.set(t.stores);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            if merge_runs() {
+                self.last_used.extend_from_slice(&t.used);
+            }
             if merge_runs() {
                 self.last_tables.extend_from_slice(&made);
             }
@@ -3198,7 +3206,6 @@ impl State {
             // Only a draw with no descriptor table of its own: tables are written
             // into the same host slots every draw, and the slots do not tell their
             // contents apart yet.
-            && p.stages.iter().all(|s| s.translated().used.is_empty())
             && count.is_none()
             && !p.stages.iter().any(|stage| stage.translated().stores);
         // Another host list (a new one after a cut, or this one after its
@@ -3425,9 +3432,9 @@ impl State {
             && kind != MESH
             && counter.is_none()
             && max == 1
-            // A draw with no descriptor table of its own: tables are made into
-            // the same host slots every draw, so a command held back would read
-            // the next draw's.
+            // A draw whose descriptor ranges and heap are those of the run: the
+            // tables may live in the same host slots, so the ranges (and the heap,
+            // in the key) are what says the contents match.
             && p.stages.iter().all(|s| s.translated().used.is_empty())
         {
             let signature_at = Interface::as_raw(&signature) as usize;
@@ -3445,6 +3452,7 @@ impl State {
                     && m.args == *self.root_arguments(kind)
                     && m.user == self.last_user
                     && m.tables == self.last_tables
+                    && m.used == self.last_used
                     && m.topology == (self.topology, self.topology_set)
                     && m.targets == self.targets
                     && m.depth == (self.depth, self.depth_state)
@@ -3473,6 +3481,7 @@ impl State {
                 args: self.root_arguments(kind).clone(),
                 user: self.last_user.clone(),
                 tables: self.last_tables.clone(),
+                used: self.last_used.clone(),
                 base: self.window.as_ref().map_or(0, |w| w.base),
                 topology: (self.topology, self.topology_set),
                 targets: self.targets.clone(),
