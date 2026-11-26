@@ -5,6 +5,51 @@ use anyhow::{Context, Result};
 use crate::{Console, Unimplemented};
 
 #[cfg(windows)]
+#[path = "fsr_4k.rs"]
+mod fsr_4k;
+
+#[cfg(any(windows, test))]
+const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
+
+#[cfg(any(windows, test))]
+fn skip_cpu_check(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[cfg(any(windows, test))]
+fn check_cpu_features_with(has_avx2: bool, skip_env: Option<&str>) -> Result<()> {
+    if has_avx2 || skip_cpu_check(skip_env) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "this CPU does not support AVX2, which Xbox Series titles require; \
+         set {SKIP_CPU_CHECK_ENV}=1 to bypass this check (for example under CPU emulation such as Intel SDE)"
+    );
+}
+
+/// Pre-flight check before executing title code: Xbox Series binaries are
+/// compiled for Zen 2 and require AVX2.
+#[cfg(windows)]
+fn check_cpu_features() -> Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    let has_avx2 = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let has_avx2 = true;
+    let skip = std::env::var(SKIP_CPU_CHECK_ENV).ok();
+    check_cpu_features_with(has_avx2, skip.as_deref())
+}
+
+/// Whether the loader's half-scale rung (`VICTORY_RENDER_SCALE=0.5`) is
+/// asked for; an FSR profile takes it over.
+#[cfg(windows)]
+fn half_scale_asked() -> bool {
+    std::env::var("VICTORY_RENDER_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        == Some(0.5)
+}
+
+#[cfg(windows)]
 pub fn run(
     exe: &Path,
     unimplemented: Unimplemented,
@@ -16,11 +61,15 @@ pub fn run(
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
+    if execute {
+        check_cpu_features()?;
+    }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    let fsr = fsr_4k::FsrPreset::requested()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
@@ -29,7 +78,39 @@ pub fn run(
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
-    let image = victory_loader::load(&prepared, &images)?;
+    let image = if let Some(preset) = fsr {
+        anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
+        // The loader's half-scale rung is the same geometry as the FSR
+        // performance preset (1920x1080 to 4K), so it selects it; the
+        // loader's own scale patches then step aside for the FSR ones.
+        let preset = if half_scale_asked() && preset != fsr_4k::FsrPreset::Performance {
+            tracing::info!(
+                asked = ?preset,
+                "VICTORY_RENDER_SCALE=0.5 with FSR selects the performance preset"
+            );
+            fsr_4k::FsrPreset::Performance
+        } else {
+            preset
+        };
+        // SAFETY: Windows supports setting the environment across threads.
+        // No title code has run yet.
+        unsafe { std::env::remove_var("VICTORY_RENDER_SCALE") };
+        fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
+        let dir = cfg.fidelityfx_dir.as_deref().context(
+            "FSR 4K requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
+        )?;
+        // Select the provider before the first lookup builds the import registry.
+        victory_hle::modules::fidelityfx::use_host_dir(dir)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("loading FSR 4.1.2 from {}", dir.display()))?;
+        // SAFETY: Windows supports setting the environment across threads.
+        // No title code has run or queried DXGI yet.
+        unsafe { std::env::set_var("VICTORY_DISPLAY_MODE", "3840x2160") };
+        let cache = cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", preset.name()))?;
+        victory_loader::load(&prepared, &cache)?
+    } else {
+        victory_loader::load(&prepared, &images)?
+    };
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in
@@ -115,7 +196,8 @@ pub fn run(
             dll: &str,
             symbol: &victory_pe::ImportSymbol,
         ) -> victory_loader::Resolution {
-            let ours = dll.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
+            let ours = !victory_hle::modules::fidelityfx::serving()
+                && dll.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
                 && matches!(symbol, victory_pe::ImportSymbol::Name { name, .. } if name == "ffxDispatch");
             if ours {
                 return victory_loader::Resolution::Found {
@@ -127,6 +209,11 @@ pub fn run(
         }
     }
     show(&exe_name, image.bind_imports(&TakeDispatch(&with_dlls), policy)?);
+    // The output size and render scale (VICTORY_OUTPUT, VICTORY_RENDER_SCALE,
+    // VICTORY_UPSCALER) are applied inside `victory_loader::load`, before this
+    // point. With an FSR profile the title's own renderer choice and scene
+    // scale are patched already; `render_scale` finds unexpected bytes at the
+    // renderer select and steps aside (the FSR preset sets the scale instead).
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
