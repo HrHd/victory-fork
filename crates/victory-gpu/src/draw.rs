@@ -37,7 +37,7 @@ enum Root {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct VertexView {
     address: u64,
     size: u32,
@@ -45,7 +45,7 @@ pub(crate) struct VertexView {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct IndexView {
     address: u64,
     size: u32,
@@ -206,6 +206,20 @@ struct Merged {
     args: Vec<Root>,
     /// The user data it was begun with.
     user: Vec<u32>,
+    tables: Vec<(u8, u32)>,
+    /// The window it belongs to, by its base offset: a new window clamps
+    /// into the scratch again and may overwrite what is pending.
+    base: u64,
+    /// State the title can change without a draw of its own: any change ends
+    /// the run.
+    topology: (u32, bool),
+    targets: Vec<usize>,
+    depth: (usize, u32),
+    heaps: [usize; 2],
+    blend: Option<[f32; 4]>,
+    stencil: Option<u32>,
+    vertex: Vec<VertexView>,
+    index: IndexView,
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -245,6 +259,9 @@ pub(crate) struct State {
     /// The user data the last `prepare` set (its view slots differ per
     /// draw even for equal roots, so a merged run must match it).
     last_user: Vec<u32>,
+    /// The view tables the last `prepare` made, by view and host slot: two
+    /// draws that made the same ones can share a command.
+    last_tables: Vec<(u8, u32)>,
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
@@ -915,6 +932,10 @@ impl State {
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
+        if merge_runs() {
+            self.last_tables.clear();
+            self.last_user.clear();
+        }
         self.prepare_for(list, indexed, false)
     }
 
@@ -1072,6 +1093,9 @@ impl State {
             let t = stage.translated();
             STORES.set(t.stores);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            if merge_runs() {
+                self.last_tables.extend_from_slice(&made);
+            }
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1142,7 +1166,9 @@ impl State {
                         l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     } else {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-            self.last_user = values.clone();
+            if merge_runs() {
+                self.last_user = values.clone();
+            }
                     }
                 }
             }
@@ -3169,6 +3195,10 @@ impl State {
         let windowed = windows()
             && kind != DISPATCH
             && max == 1
+            // Only a draw with no descriptor table of its own: tables are written
+            // into the same host slots every draw, and the slots do not tell their
+            // contents apart yet.
+            && p.stages.iter().all(|s| s.translated().used.is_empty())
             && count.is_none()
             && !p.stages.iter().any(|stage| stage.translated().stores);
         // Another host list (a new one after a cut, or this one after its
@@ -3221,6 +3251,7 @@ impl State {
         } else {
             None
         };
+        let was_hit = hit.is_some();
         let (bounded, at) = match (hit, gathered) {
             (Some((scratch, at, step)), _) => {
                 // Diagnostics of windows: the record clamped again and
@@ -3390,10 +3421,22 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
-        if merge_runs() && kind != MESH && counter.is_none() && max == 1 {
+        if merge_runs()
+            && kind != MESH
+            && counter.is_none()
+            && max == 1
+            // A draw with no descriptor table of its own: tables are made into
+            // the same host slots every draw, so a command held back would read
+            // the next draw's.
+            && p.stages.iter().all(|s| s.translated().used.is_empty())
+        {
             let signature_at = Interface::as_raw(&signature) as usize;
             let scratch_at = Interface::as_raw(&bounded) as usize;
-            let continues = self.merged.as_ref().is_some_and(|m| {
+            let same_window = match (&self.window, &self.merged) {
+                (Some(w), Some(m)) => w.base == m.base,
+                _ => false,
+            };
+            let continues = was_hit && same_window && self.merged.as_ref().is_some_and(|m| {
                 Interface::as_raw(&m.signature) as usize == signature_at
                     && Interface::as_raw(&m.scratch) as usize == scratch_at
                     && m.last_at + m.step == at
@@ -3401,6 +3444,15 @@ impl State {
                     && m.roots == self.host_roots
                     && m.args == *self.root_arguments(kind)
                     && m.user == self.last_user
+                    && m.tables == self.last_tables
+                    && m.topology == (self.topology, self.topology_set)
+                    && m.targets == self.targets
+                    && m.depth == (self.depth, self.depth_state)
+                    && m.heaps == self.heaps
+                    && m.blend == self.blend
+                    && m.stencil == self.stencil
+                    && m.vertex[..] == self.vertex[..]
+                    && m.index == self.index
             });
             if continues {
                 let m = self.merged.as_mut().expect("checked above");
@@ -3420,6 +3472,16 @@ impl State {
                 roots: self.host_roots,
                 args: self.root_arguments(kind).clone(),
                 user: self.last_user.clone(),
+                tables: self.last_tables.clone(),
+                base: self.window.as_ref().map_or(0, |w| w.base),
+                topology: (self.topology, self.topology_set),
+                targets: self.targets.clone(),
+                depth: (self.depth, self.depth_state),
+                heaps: self.heaps,
+                blend: self.blend,
+                stencil: self.stencil,
+                vertex: self.vertex.to_vec(),
+                index: self.index,
             });
             return true;
         }
