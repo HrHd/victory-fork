@@ -50,9 +50,10 @@ pub(crate) unsafe fn apply(base: usize, size: usize, hash: &blake3::Hash) -> Res
         tracing::warn!("VICTORY_RENDER_SCALE supports 0.5 for this experiment");
         return Ok(());
     }
+    // A patched image of the same build hashes differently; the byte checks
+    // below decide, so only note it.
     if !hash.to_hex().starts_with(BUILD) {
-        tracing::warn!("render scale skipped for an unsupported title build");
-        return Ok(());
+        tracing::warn!("render scale on an unlisted title build: the mapped bytes decide");
     }
     // SAFETY: the caller guarantees that the identified image is fully loaded.
     if unsafe { apply_patches(base, size, &half_resolution()) }? {
