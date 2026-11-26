@@ -25,7 +25,7 @@ use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
 /// A root argument as the title set it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 enum Root {
     #[default]
     None,
@@ -190,6 +190,24 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0")) && !crate::drvwatch::tripped()
 }
 
+/// A run of one-record indirect draws waiting to be executed as one
+/// `ExecuteIndirect` (`merge_runs`).
+struct Merged {
+    signature: ID3D12CommandSignature,
+    scratch: ID3D12Resource,
+    at: u64,
+    records: u32,
+    last_at: u64,
+    step: u64,
+    pipeline: usize,
+    roots: [usize; 2],
+    /// The title's root arguments, which our user data is set from:
+    /// two draws merged into one command share them.
+    args: Vec<Root>,
+    /// The user data it was begun with.
+    user: Vec<u32>,
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -220,6 +238,13 @@ pub(crate) struct State {
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
     depth_bounds: Option<[f32; 2]>,
+    /// A run of one-record indirect draws not executed yet ([`merge_runs`]):
+    /// the signature, the scratch slot it starts at, how many records, where the
+    /// last one is, its step, and the host state it was begun under.
+    merged: Option<Merged>,
+    /// The user data the last `prepare` set (its view slots differ per
+    /// draw even for equal roots, so a merged run must match it).
+    last_user: Vec<u32>,
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
@@ -752,6 +777,7 @@ impl State {
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        self.flush_merged(list);
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -1116,6 +1142,7 @@ impl State {
                         l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     } else {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+            self.last_user = values.clone();
                     }
                 }
             }
@@ -2133,10 +2160,26 @@ impl State {
         crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
     }
 
+    /// The title's root arguments of a command of `kind`.
+    fn root_arguments(&self, kind: u32) -> &Vec<Root> {
+        // 2 is the dispatch kind.
+        if kind == 2 { &self.compute } else { &self.graphics }
+    }
+
+    /// Runs the indirect draws of a pending run, if any ([`merge_runs`]).
+    pub(crate) fn flush_merged(&mut self, list: &HostList) {
+        let Some(m) = self.merged.take() else { return };
+        // SAFETY: an open list; the signature, the scratch slot and the copies
+        // behind it are kept alive by the list.
+        unsafe { list.list.ExecuteIndirect(&m.signature, m.records, &m.scratch, m.at, None, 0) };
+        DRAWN.fetch_add(u64::from(m.records), Ordering::Relaxed);
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
-        self.window = None;
+        self.flush_merged(list);
+self.window = None;
         list.gather_close();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -2482,7 +2525,8 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
+        self.flush_merged(list);
+self.window = None;
         if self.may_store() {
             list.gather_close();
         }
@@ -2876,6 +2920,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        self.flush_merged(list);
         self.window = None;
         if self.may_store() {
             list.gather_close();
@@ -2984,6 +3029,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        self.flush_merged(list);
         self.window = None;
         if self.may_store() {
             list.gather_close();
@@ -3343,6 +3389,42 @@ impl State {
         });
         if kind == MESH {
             self.mesh_scissor(list, true);
+        }
+        if merge_runs() && kind != MESH && counter.is_none() && max == 1 {
+            let signature_at = Interface::as_raw(&signature) as usize;
+            let scratch_at = Interface::as_raw(&bounded) as usize;
+            let continues = self.merged.as_ref().is_some_and(|m| {
+                Interface::as_raw(&m.signature) as usize == signature_at
+                    && Interface::as_raw(&m.scratch) as usize == scratch_at
+                    && m.last_at + m.step == at
+                    && m.pipeline == self.host_pipeline
+                    && m.roots == self.host_roots
+                    && m.args == *self.root_arguments(kind)
+                    && m.user == self.last_user
+            });
+            if continues {
+                let m = self.merged.as_mut().expect("checked above");
+                m.records += 1;
+                m.last_at = at;
+                return true;
+            }
+            self.flush_merged(list);
+            self.merged = Some(Merged {
+                signature: signature.clone(),
+                scratch: bounded.clone(),
+                at,
+                records: 1,
+                last_at: at,
+                step: u64::from(stride),
+                pipeline: self.host_pipeline,
+                roots: self.host_roots,
+                args: self.root_arguments(kind).clone(),
+                user: self.last_user.clone(),
+            });
+            return true;
+        }
+        if merge_runs() {
+            self.flush_merged(list);
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
@@ -3756,6 +3838,20 @@ fn jump_windows() -> bool {
             on
         }
     }
+}
+
+/// Whether consecutive indirect draws of one record, at consecutive records of
+/// one argument buffer, are run as one `ExecuteIndirect` of several records
+/// (`VICTORY_MERGE_RUNS=1`; off by default).
+///
+/// A command signature cannot set a root descriptor table, so a run of the
+/// title's one-record mesh draws could only be merged once root views are
+/// read by heap index (`VICTORY_ROOT_VIEW_INDEX`, step 0 of #828). This
+/// merges what the window already clamped, so the records are consecutive in
+/// our scratch: nothing is clamped for the merge itself.
+fn merge_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_RUNS").is_some_and(|v| v == "1"))
 }
 
 /// Whether a single record that misses its window is gathered: given a
