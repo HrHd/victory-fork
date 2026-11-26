@@ -190,6 +190,43 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0")) && !crate::drvwatch::tripped()
 }
 
+/// Folds `v` into `h`.
+fn fold(h: u64, v: u64) -> u64 {
+    (h.rotate_left(5) ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+/// A hash of what a descriptor range is: its kind, root, place and register.
+trait Fold {
+    fn fold(&self) -> u64;
+}
+
+impl Fold for UsedResource {
+    fn fold(&self) -> u64 {
+        let mut h = u64::from(self.slot);
+        h = fold(
+            h,
+            match self.kind {
+                ResourceType::Srv => 0,
+                ResourceType::Sampler => 1,
+                ResourceType::Cbv => 2,
+                ResourceType::Uav => 3,
+                ResourceType::Other(n) => 4 + u64::from(n),
+            },
+        );
+        h = fold(h, u64::from(self.lower_bound));
+        h = fold(h, u64::from(self.table_offset_dwords));
+        h = fold(h, u64::from(self.stride));
+        h = fold(h, u64::from(self.dwords));
+        fold(h, u64::from(self.user_data))
+    }
+}
+
+impl Fold for [usize; 2] {
+    fn fold(&self) -> u64 {
+        fold(fold(0, self[0] as u64), self[1] as u64)
+    }
+}
+
 /// A run of one-record indirect draws waiting to be executed as one
 /// `ExecuteIndirect` (`merge_runs`).
 struct Merged {
@@ -207,7 +244,8 @@ struct Merged {
     /// The user data it was begun with.
     user: Vec<u32>,
     tables: Vec<(u8, u32)>,
-    used: Vec<UsedResource>,
+    used: u64,
+    heaps_hash: u64,
     /// The window it belongs to, by its base offset: a new window clamps
     /// into the scratch again and may overwrite what is pending.
     base: u64,
@@ -265,7 +303,8 @@ pub(crate) struct State {
     last_tables: Vec<(u8, u32)>,
     /// The descriptor ranges those tables were made from (with [`heaps`],
     /// what their contents are), in stage order.
-    last_used: Vec<UsedResource>,
+    /// Folded from the ranges and the heap when the run began.
+    last_used: u64,
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
@@ -939,7 +978,6 @@ impl State {
         if merge_runs() {
             self.last_tables.clear();
             self.last_user.clear();
-            self.last_used.clear();
         }
         self.prepare_for(list, indexed, false)
     }
@@ -1099,7 +1137,9 @@ impl State {
             STORES.set(t.stores);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             if merge_runs() {
-                self.last_used.extend_from_slice(&t.used);
+                for u in &t.used {
+                    self.last_used = fold(self.last_used, u.fold());
+                }
             }
             if merge_runs() {
                 self.last_tables.extend_from_slice(&made);
@@ -3453,6 +3493,7 @@ impl State {
                     && m.user == self.last_user
                     && m.tables == self.last_tables
                     && m.used == self.last_used
+                    && m.heaps_hash == self.heaps.fold()
                     && m.topology == (self.topology, self.topology_set)
                     && m.targets == self.targets
                     && m.depth == (self.depth, self.depth_state)
@@ -3481,7 +3522,8 @@ impl State {
                 args: self.root_arguments(kind).clone(),
                 user: self.last_user.clone(),
                 tables: self.last_tables.clone(),
-                used: self.last_used.clone(),
+                used: self.last_used,
+                heaps_hash: self.heaps.fold(),
                 base: self.window.as_ref().map_or(0, |w| w.base),
                 topology: (self.topology, self.topology_set),
                 targets: self.targets.clone(),
