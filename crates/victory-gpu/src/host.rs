@@ -6220,16 +6220,38 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
-        let wanted = legal_state(texture, wanted);
+        self.transition_held(&copy, wanted)
+            .map(|(before, _)| (texture, before))
+    }
+
+    /// [`HostList::transition`] of a host copy the caller holds: the state
+    /// it leaves and the (legal) state it takes, if that is a change.
+    pub(crate) fn transition_held(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<(u32, u32)> {
+        let wanted = copy.legal(wanted);
+        self.track(copy, wanted).map(|before| (before, wanted))
+    }
+
+    /// The list's state for host texture `copy` becomes `wanted`: the state
+    /// it leaves, if that is a change. The list's first use records nothing
+    /// (see `transition`).
+    fn track(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<u32> {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
+                v.insert((wanted, wanted, copy.clone()));
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some(before)
             }
         }
     }
@@ -6239,28 +6261,26 @@ impl HostList {
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
-        let wanted = legal_state(&copy.texture, wanted);
-        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy.clone()));
-                None
-            }
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some(before)
-            }
-        };
-        drop(states);
-        if let Some(before) = before {
-            let barrier = transition(
-                &copy.texture,
-                D3D12_RESOURCE_STATES(before as i32),
-                D3D12_RESOURCE_STATES(wanted as i32),
-            );
+        if let Some(barrier) = self.move_texture(copy, wanted) {
             // SAFETY: an open list and a live texture.
             unsafe { self.list.ResourceBarrier(&[barrier]) };
         }
+    }
+
+    /// [`HostList::transition`] for a host texture of ours (a twin's
+    /// plane), without twins: the barrier to record, if one is needed.
+    pub(crate) fn move_texture(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<D3D12_RESOURCE_BARRIER> {
+        let wanted = copy.legal(wanted);
+        let before = self.track(copy, wanted)?;
+        Some(transition(
+            &copy.texture,
+            D3D12_RESOURCE_STATES(before as i32),
+            D3D12_RESOURCE_STATES(wanted as i32),
+        ))
     }
 
     /// A use of title texture `resource` about to be recorded, if it is a
@@ -7044,6 +7064,19 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    /// The state this list has for host copy `copy`, if it has one (tests).
+    #[cfg(test)]
+    pub(crate) fn state_of(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+    ) -> Option<u32> {
+        self.states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(std::sync::Arc::as_ptr(copy) as usize))
+            .map(|states| states.1)
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.

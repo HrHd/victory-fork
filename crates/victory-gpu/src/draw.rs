@@ -3671,11 +3671,17 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
-            if !aliased
-                && let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
+            // One host copy for the upload and the state: looked up once
+            // (each lookup takes the resource's lock), its flags kept.
+            let copy = if aliased {
+                None
+            } else {
+                crate::resource::host_copy(*resource as This)
+            };
+            if let Some(copy) = &copy
+                && copy.title_written()
             {
-                crate::texture::upload(list, *resource as This, t);
+                crate::texture::upload_copy(list, *resource as This, copy);
             }
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(*resource as This, false, false);
@@ -3688,7 +3694,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             } else {
                 SHADER_RESOURCE
             };
-            crate::list::ensure_state(list, *resource as This, state);
+            match copy {
+                Some(copy) => crate::list::ensure_held_state(list, &copy, state),
+                None => crate::list::ensure_state(list, *resource as This, state),
+            }
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
@@ -4071,5 +4080,161 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
+    }
+
+    /// A host texture's flags are read once, when it is made: the legal
+    /// states and whether title memory fills it are what asking the driver
+    /// for its description gives, for every kind of texture.
+    #[test]
+    fn a_host_textures_kept_flags_give_what_its_description_does() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let kinds = [
+            (D3D12_RESOURCE_FLAG_NONE, DXGI_FORMAT_R8G8B8A8_UNORM),
+            (
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+            ),
+            (
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+            ),
+            (
+                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                DXGI_FORMAT_D32_FLOAT,
+            ),
+            (
+                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
+                DXGI_FORMAT_D32_FLOAT,
+            ),
+        ];
+        // Every state bit a list asks for, and the common mixes.
+        let states: Vec<u32> = (0..24)
+            .map(|b| 1u32 << b)
+            .chain([0, 0xc0, 0x10 | 0x40, 0x8 | 0xc0])
+            .collect();
+        for (flags, format) in kinds {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Flags: flags,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: a valid description and output.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+            }
+            let texture = texture.unwrap();
+            let copy = crate::resource::HostTexture::new(texture.clone(), 0);
+            assert_eq!(copy.flags, flags.0 as u32);
+            assert_eq!(
+                copy.title_written(),
+                crate::texture::title_written(&texture),
+                "flags {:#x}",
+                flags.0
+            );
+            for &state in &states {
+                assert_eq!(
+                    copy.legal(state),
+                    crate::host::legal_state(&texture, state),
+                    "flags {:#x}, state {state:#x}",
+                    flags.0
+                );
+            }
+        }
+    }
+
+    /// A draw's texture read takes its host copy once for the upload and
+    /// the state: the moves are those of a read by resource, the upload is
+    /// recorded once in the list, and a texture the host wrote is not
+    /// uploaded.
+    #[test]
+    fn a_texture_read_uploads_once_and_moves_as_a_read_by_resource() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        const COPY_SOURCE: u32 = 0x800;
+        // Two title textures on the host, of the kind the title fills (no
+        // render target, depth or unordered access flag).
+        let textures: Vec<This> = (0..2)
+            .map(|_| crate::resource::test_title_texture(0))
+            .collect();
+        let mut view_desc = [0u32; 10];
+        view_desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        let copies: Vec<_> = textures
+            .iter()
+            .map(|&t| crate::resource::host_copy(t).unwrap())
+            .collect();
+        crate::texture::host_written(textures[1]);
+        let list = host.new_list().unwrap();
+        assert_eq!(list.state_of(&copies[0]), None, "no state yet");
+        let read = |k: usize| {
+            readable(
+                &list,
+                ResourceType::Srv,
+                &View::Shader(textures[k] as usize, Some(view_desc)),
+            )
+        };
+        read(0);
+        assert_eq!(
+            list.state_of(&copies[0]),
+            Some(SHADER_RESOURCE),
+            "the first use is the prelude's"
+        );
+        crate::list::ensure_state(&list, textures[0], COPY_SOURCE);
+        assert_eq!(list.state_of(&copies[0]), Some(COPY_SOURCE));
+        read(0);
+        assert_eq!(
+            list.state_of(&copies[0]),
+            Some(SHADER_RESOURCE),
+            "the read moves it as a read by resource does"
+        );
+        read(0);
+        assert_eq!(
+            list.state_of(&copies[0]),
+            Some(SHADER_RESOURCE),
+            "unchanged: nothing more to move"
+        );
+        assert!(
+            !list.first_use(textures[0] as usize),
+            "the title-written texture's upload is recorded in the list"
+        );
+        read(1);
+        assert!(
+            list.first_use(textures[1] as usize),
+            "a texture the host wrote is not uploaded"
+        );
+        list.close();
+        type Release = extern "system" fn(This) -> u32;
+        for t in textures {
+            let _ = crate::object::slot::<Release>(t, 0x10)(t);
+        }
     }
 }

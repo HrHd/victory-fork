@@ -635,9 +635,14 @@ pub(crate) fn forget(resource: usize) {
 /// Whether `resource`'s host copy takes its contents from title memory:
 /// a texture the host GPU does not render to or write.
 pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
-    const TARGET_DEPTH_UNORDERED: i32 = 0x7;
     // SAFETY: a live resource.
-    unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
+    title_written_flags(unsafe { texture.GetDesc() }.Flags.0 as u32)
+}
+
+/// [`title_written`] of a texture with resource flags `flags`.
+pub(crate) fn title_written_flags(flags: u32) -> bool {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    flags & TARGET_DEPTH_UNORDERED == 0
 }
 
 /// Records, once per list, the copy of `resource`'s staging buffer into
@@ -645,19 +650,74 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
+    if host_wrote(resource as usize) || !list.first_use(resource as usize) {
+        kept_host_contents(resource, texture);
         return;
     }
     let Some(staging) = staging(resource, texture) else {
         return;
     };
+    upload_body(list, resource, texture, staging, None);
+}
+
+/// [`upload`] of `resource`'s host copy `copy`, which the caller already
+/// holds (a draw's table entry): the same, without looking it up again.
+pub(crate) fn upload_copy(
+    list: &HostList,
+    resource: This,
+    copy: &Arc<crate::resource::HostTexture>,
+) {
+    if host_wrote(resource as usize) {
+        kept_host_contents(resource, &copy.texture);
+        return;
+    }
+    if !list.first_use(resource as usize) {
+        return;
+    }
+    let Some(staging) = staging(resource, &copy.texture) else {
+        return;
+    };
+    upload_body(list, resource, &copy.texture, staging, Some(copy));
+}
+
+/// Diagnostics: says once per title texture that it keeps what the host
+/// copied into it.
+#[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+fn kept_host_contents(resource: This, texture: &ID3D12Resource) {
+    #[cfg(feature = "diagnostics")]
+    {
+        static SEEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+        if SEEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_default()
+            .insert(resource as usize)
+        {
+            let memory = crate::resource::texture_memory(resource).map(|(m, _)| m);
+            // SAFETY: a live resource.
+            let desc = unsafe { texture.GetDesc() };
+            tracing::debug!(
+                ?resource,
+                ?memory,
+                ?desc,
+                "a sampled texture keeps what the host copied into it: not uploaded from title memory"
+            );
+        }
+    }
+}
+
+/// The copy [`upload`] and [`upload_copy`] record, once the list's first
+/// use of `resource` has taken its staging buffer. `copy` is
+/// `resource`'s host copy when the caller holds it.
+fn upload_body(
+    list: &HostList,
+    resource: This,
+    texture: &ID3D12Resource,
+    staging: std::sync::Arc<Staging>,
+    copy: Option<&Arc<crate::resource::HostTexture>>,
+) {
     use std::sync::atomic::Ordering::Relaxed;
     staging.used.store(crate::host::moment(), Relaxed);
     // Levels on demand: a view of the texture now starts at another
@@ -700,7 +760,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
     crate::framelog::add(crate::framelog::T::Uploads, 1);
     const COPY_DEST: u32 = 0x400;
-    crate::list::ensure_state(list, resource, COPY_DEST);
+    match copy {
+        Some(copy) => crate::list::ensure_held_state(list, copy, COPY_DEST),
+        None => crate::list::ensure_state(list, resource, COPY_DEST),
+    }
     // The staging buffer lives as long as `staging`, which the deferred
     // refresh below holds until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {

@@ -1124,6 +1124,10 @@ struct Resource {
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    /// The host texture's resource flags (render target, depth, unordered
+    /// access, denied shader resource), read once: a texture's description
+    /// never changes, and each use asked the driver for it again.
+    pub(crate) flags: u32,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// The bytes the host gives it.
     bytes: u64,
@@ -1970,28 +1974,34 @@ pub(crate) fn census() -> [u64; 10] {
 pub(crate) static HOST_TEXTURES: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
-/// The bytes the host allocates for `texture`.
+/// The bytes the host allocates for a texture of `desc`.
 #[cfg(windows)]
-fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> u64 {
+fn host_bytes(desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC) -> u64 {
     let Some(host) = crate::host::host() else {
         return 0;
     };
-    // SAFETY: plain queries on a live resource and device.
-    unsafe {
-        let desc = texture.GetDesc();
-        host.device.GetResourceAllocationInfo(0, &[desc]).SizeInBytes
-    }
+    // SAFETY: a plain query on a live device.
+    unsafe { host.device.GetResourceAllocationInfo(0, &[*desc]).SizeInBytes }
 }
 
 #[cfg(windows)]
 impl HostTexture {
-    fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
+    /// A host texture of `texture`. Its resource flags are read once here:
+    /// a texture's description never changes, and each use asked the
+    /// driver for it again.
+    pub(crate) fn new(
+        texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+    ) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
-        let bytes = host_bytes(&texture);
+        // SAFETY: a plain query on a live resource.
+        let desc = unsafe { texture.GetDesc() };
+        let bytes = host_bytes(&desc);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
             texture,
+            flags: desc.Flags.0 as u32,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
@@ -2007,15 +2017,28 @@ impl HostTexture {
         state: u32,
         tiled: crate::tiles::Tiled,
     ) -> HostTexture {
+        // SAFETY: a plain query on a live resource.
+        let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
         HOST_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
             texture,
+            flags,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
             born_after: crate::host::started(),
         }
+    }
+
+    /// [`crate::host::legal_state`] of `state` for this texture.
+    pub(crate) fn legal(&self, state: u32) -> u32 {
+        crate::host::legal_for(self.flags, state)
+    }
+
+    /// [`crate::texture::title_written`] of this texture.
+    pub(crate) fn title_written(&self) -> bool {
+        crate::texture::title_written_flags(self.flags)
     }
 }
 
@@ -2470,6 +2493,47 @@ pub(crate) fn scale_of(this: This) -> u32 {
         return 1;
     }
     resource(this).scale
+}
+
+/// A title texture the host can copy, for other modules' tests: 64x64
+/// RGBA8, title-written unless `flags` say otherwise.
+#[cfg(test)]
+pub(crate) fn test_title_texture(flags: u32) -> This {
+    let desc = ResourceDesc {
+        dimension: 3,
+        alignment: 0,
+        width: 64,
+        height: 64,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format: 28,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags,
+    };
+    let properties = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 0,
+        visible_nodes: 0,
+    };
+    let mut texture = std::ptr::null();
+    assert_eq!(
+        create_committed(
+            std::ptr::null(),
+            &properties,
+            0,
+            &desc,
+            0,
+            std::ptr::null(),
+            &RESOURCE_IIDS[0],
+            &mut texture
+        ),
+        0
+    );
+    texture
 }
 
 pub(crate) extern "system" fn create_committed(
