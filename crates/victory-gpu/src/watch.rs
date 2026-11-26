@@ -23,6 +23,10 @@
 //! [`MANY_VIEWS`] views). A
 //! system call writing into a guarded block fails (none is known to).
 
+use crate::texture::waited;
+const PARTS: usize = PAGE / KERNEL_PAGE;
+const WHOLE: u16 = u16::MAX;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
@@ -1191,7 +1195,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
-fn install() {
+pub(crate) fn install() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
@@ -1927,3 +1931,69 @@ pub(crate) fn change_done() -> u64 {
         unsafe { windows_sys::Win32::System::Threading::Sleep(u32::from(tries > 200)) };
     }
 }
+
+/// The 4 KiB pages of title memory that what shaders wrote was put into,
+/// and the frame it last was: in pieces made when first needed and never let
+/// go. Some 20,000 pages a frame are noted by the relay and the landing
+/// threads: in a map behind one lock that was 309 waits for it and 280 looks
+/// at its table in the 40 s of a profile, as many as all else of the landings'
+/// notes (run faults-5).
+struct Landed([std::sync::atomic::AtomicPtr<LandedPiece>; Landed::PIECES]);
+
+/// Of 256 MiB: the frame (its low 31 bits and one), 0 for never.
+type LandedPiece = [std::sync::atomic::AtomicU32; Landed::PAGES];
+
+impl Landed {
+    const PAGES: usize = 1 << 16;
+    /// 128 TiB, what a process has.
+    const PIECES: usize = 1 << 19;
+
+    fn stamp(frame: u64) -> u32 {
+        (frame as u32 & 0x7fff_ffff) + 1
+    }
+
+    fn note(&self, page: usize, frame: u64) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+        let Some(place) = self.0.get(page / Landed::PAGES) else {
+            return;
+        };
+        let mut piece = place.load(Acquire);
+        if piece.is_null() {
+            let made: Box<LandedPiece> = Box::new([const { std::sync::atomic::AtomicU32::new(0) }; Landed::PAGES]);
+            let made = Box::into_raw(made);
+            piece = match place.compare_exchange(std::ptr::null_mut(), made, AcqRel, Acquire) {
+                Ok(_) => made,
+                Err(there) => {
+                    // SAFETY: made just now, and another thread's is there.
+                    drop(unsafe { Box::from_raw(made) });
+                    there
+                }
+            };
+        }
+        // SAFETY: a piece, which is never freed.
+        let at = unsafe { &(&*piece)[page % Landed::PAGES] };
+        let stamp = Landed::stamp(frame);
+        // (Most are noted several times a frame: no write then.)
+        if at.load(Relaxed) != stamp {
+            at.store(stamp, Relaxed);
+        }
+    }
+
+    /// Whether `page` was noted in a frame from `since` on, up to `now`.
+    fn since(&self, page: usize, since: u64, now: u64) -> bool {
+        let Some(place) = self.0.get(page / Landed::PAGES) else {
+            return false;
+        };
+        // SAFETY: null, or a piece, which is never freed.
+        let Some(piece) = (unsafe { place.load(std::sync::atomic::Ordering::Acquire).as_ref() }) else {
+            return false;
+        };
+        let stamp = piece[page % Landed::PAGES].load(std::sync::atomic::Ordering::Relaxed);
+        stamp != 0 && u64::from(Landed::stamp(now).wrapping_sub(stamp) & 0x7fff_ffff) <= now.saturating_sub(since)
+    }
+}
+
+static LANDED: Landed = Landed([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Landed::PIECES]);
+
+static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

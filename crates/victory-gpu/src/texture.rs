@@ -398,7 +398,7 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sy
 pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
-fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
+pub(crate) fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
     let out = f();
     let us = started.elapsed().as_micros() as u64;
@@ -1613,9 +1613,3 @@ mod title_memory_tests {
     }
 }
 
-pub(crate) fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
-    let started = std::time::Instant::now();
-    let out = f();
-    REFRESH_WAITS[slot].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
-    out
-}

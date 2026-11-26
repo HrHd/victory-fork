@@ -4303,3 +4303,5 @@ pub(crate) fn exact_back() -> bool {
 pub(crate) fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
+
+pub(crate) static PUT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
