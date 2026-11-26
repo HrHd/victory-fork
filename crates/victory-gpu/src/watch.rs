@@ -558,6 +558,7 @@ fn known_view(start: usize) -> bool {
         return false;
     }
     let g = guards();
+    let first = start / BLOCK;
     g.protected.contains(&first)
         || g.absent.contains(&first)
         || g.pinned.contains_key(&first)
@@ -2350,3 +2351,20 @@ mod mapping_tests {
         assert!(read.load(Ordering::SeqCst));
     }
 }
+
+/// Whether the light watch paths are on (upstream keeps blocks published for
+/// reuse; here the switch is inert until that half is ported).
+fn light_kept() -> bool {
+    false
+}
+
+/// Blocks published for reuse (see [light_kept]).
+struct PublishedBits;
+
+impl PublishedBits {
+    const fn new() -> PublishedBits { PublishedBits }
+    fn clear(&self, _block: usize) {}
+}
+
+static PUBLISHED: PublishedBits = PublishedBits::new();
+
