@@ -1365,7 +1365,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
+        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::raising() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode
@@ -2219,7 +2219,7 @@ fn host_texture_as(
 /// without memory of its own (`crate::tiles`); it is not made here.
 #[cfg(windows)]
 pub(crate) fn host_tiled(this: This) -> Option<OnDemand> {
-    if this.is_null() || !crate::tiles::wanted() {
+    if this.is_null() || !crate::tiles::raising() {
         return None;
     }
     hosted(this, false).map(|(host, _)| host).filter(|host| host.tiled.is_some()).map(OnDemand)

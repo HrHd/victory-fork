@@ -74,7 +74,7 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (0x28, DOWN),
     (0x25, LEFT),
     (0x27, RIGHT),
-    (b'Q', LEFT_SHOULDER),
+    (b'Q', A), // for keyboard testing: Q is A too
     (b'E', RIGHT_SHOULDER),
     (b'F', LEFT_STICK),
     (b'H', RIGHT_STICK),
@@ -1155,6 +1155,19 @@ mod host {
                 for vk in scripted() {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
                         pad.buttons |= button;
+                    }
+                    // Still on the sticks, for titles that steer by them rather than
+                    // by the d-pad: W/A/S/D is the left stick, the arrows the right.
+                    match vk {
+                        b'W' => pad.left_y = 1.0,
+                        b'S' => pad.left_y = -1.0,
+                        b'A' => pad.left_x = -1.0,
+                        b'D' => pad.left_x = 1.0,
+                        0x26 => pad.right_y = 1.0,
+                        0x28 => pad.right_y = -1.0,
+                        0x25 => pad.right_x = -1.0,
+                        0x27 => pad.right_x = 1.0,
+                        _ => {}
                     }
                 }
             }

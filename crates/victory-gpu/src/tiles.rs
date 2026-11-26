@@ -73,6 +73,25 @@ pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 /// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
 /// zeros from, and drops writes to, levels without memory (tiled resources
 /// tier 2).
+/// With `VICTORY_ZONE_HOLD` (seconds): whether levels are still being raised -
+/// false once the hold has passed, so a measured area stops changing under the
+/// arms (`D:\Vi\AREA-ISOLATION.md`).
+fn zone_held() -> bool {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let Some(secs) = std::env::var("VICTORY_ZONE_HOLD")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    else {
+        return false;
+    };
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs() > secs
+}
+
+/// [`wanted`], and not held by a zone hold.
+pub(crate) fn raising() -> bool {
+    wanted() && !zone_held()
+}
+
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {

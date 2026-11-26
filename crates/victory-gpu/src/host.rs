@@ -9734,6 +9734,21 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // A title that sizes its own window (this one asks for 3840x2160) is cut to
+    // the desktop here, so nothing is ever wider than the screen.
+    if message == WM_WINDOWPOSCHANGING && lparam.0 != 0 {
+        // SAFETY: the message carries a WINDOWPOS for this call.
+        let pos = unsafe { &mut *(lparam.0 as *mut WINDOWPOS) };
+        let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+        if pos.cx > w {
+            pos.cx = w;
+        }
+        if pos.cy > h - 80 {
+            pos.cy = (h - 80).max(480);
+        }
+        pos.x = pos.x.clamp(0, (w - pos.cx).max(0));
+        pos.y = pos.y.clamp(0, (h - pos.cy).max(0));
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
@@ -9752,6 +9767,12 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             ..Default::default()
         };
         RegisterClassExW(&class);
+        // A tile asks for 4K; on a smaller desktop the window would be a crop
+        // bigger than the screen, so it is cut to the desktop (and the present
+        // scales into it).
+        let (screen_w, screen_h) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+        let width = width.min(screen_w.max(640) as u32);
+        let height = height.min((screen_h - 80).max(480) as u32);
         let mut rect = RECT {
             left: 0,
             top: 0,
@@ -9762,7 +9783,7 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
-            w!("Kelvaroq"),
+            w!("Nightfall"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
