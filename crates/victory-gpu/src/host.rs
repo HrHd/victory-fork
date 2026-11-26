@@ -1054,6 +1054,8 @@ pub(crate) struct HostList {
     /// since the last global UAV barrier on this list (starts true to order
     /// writes from earlier command lists).
     uav_dirty: AtomicBool,
+    /// Pending `heap_buffer_pass` refresh ranges computed off-thread by `aside`.
+    coming: Mutex<Option<(usize, std::sync::Arc<aside::Coming>)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The pair of timestamps its run is timed with since its last reset
@@ -4511,6 +4513,7 @@ impl Host {
                 indirect_args: Mutex::default(),
                 window_check: OnceLock::new(),
                 uav_dirty: AtomicBool::new(true),
+                coming: Mutex::new(None),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
                 pipeline_meter: AtomicU32::new(u32::MAX),
@@ -6739,6 +6742,89 @@ impl Host {
     }
 }
 
+/// Background worker for offloading `heap_buffer_pass` off recording threads
+/// (`VICTORY_HEAP_PASS_ASIDE=0` runs it inline).
+pub(crate) mod aside {
+    use super::*;
+
+    pub(crate) type Refresh = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
+
+    pub(crate) struct Coming(Mutex<Option<Vec<Refresh>>>, std::sync::Condvar);
+
+    impl Coming {
+        pub(crate) fn wait(&self) -> Vec<Refresh> {
+            let mut found = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(found) = found.take() {
+                    return found;
+                }
+                found = self.1.wait(found).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+
+        fn found(&self, what: Vec<Refresh>) {
+            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(what);
+            self.1.notify_all();
+        }
+    }
+
+    pub(crate) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_ASIDE").is_none_or(|v| v != "0"))
+    }
+
+    type Job = Box<dyn FnOnce() + Send>;
+
+    pub(crate) fn begin(
+        work: impl FnOnce() -> Vec<Refresh> + Send + 'static,
+    ) -> std::sync::Arc<Coming> {
+        static THREAD: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Job>>>> = OnceLock::new();
+        let coming = std::sync::Arc::new(Coming(Mutex::new(None), std::sync::Condvar::new()));
+        let told = coming.clone();
+        let job: Job = Box::new(move || {
+            let found =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_default();
+            told.found(found);
+        });
+        let thread = THREAD.get_or_init(|| {
+            let (send, jobs) = std::sync::mpsc::channel::<Job>();
+            std::thread::Builder::new()
+                .name("victory-aside".into())
+                .spawn(move || jobs.into_iter().for_each(|job| job()))
+                .ok()
+                .map(|_| Mutex::new(send))
+        });
+        match thread {
+            Some(send) => {
+                if let Err(job) = send.lock().unwrap_or_else(|e| e.into_inner()).send(job) {
+                    (job.0)();
+                }
+            }
+            None => job(),
+        }
+        coming
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn what_is_found_is_waited_for_and_a_panic_lets_the_list_go_on() {
+            let (go, wait) = std::sync::mpsc::channel::<()>();
+            let coming = begin(move || {
+                let _ = wait.recv();
+                Vec::new()
+            });
+            assert!(coming.0.lock().unwrap().is_none());
+            go.send(()).unwrap();
+            assert!(coming.wait().is_empty());
+            assert!(begin(|| panic!("a panic of the work")).wait().is_empty());
+            assert!(begin(Vec::new).wait().is_empty());
+        }
+    }
+}
+
 impl HostList {
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
@@ -6816,7 +6902,42 @@ impl HostList {
         times
     }
 
+    /// Runs `work` on the `aside` worker thread and splices the resulting
+    /// refreshes into `deferred.copies` at the current recording position when
+    /// the list closes.
+    pub(crate) fn refreshes_coming(
+        &self,
+        work: impl FnOnce() -> Vec<aside::Refresh> + Send + 'static,
+    ) {
+        self.finish_coming();
+        let pos = self.deferred().copies.len();
+        let coming = aside::begin(work);
+        *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = Some((pos, coming));
+    }
+
+    /// Waits for any pending `aside` heap pass and inserts its refresh steps
+    /// at the recorded position without holding `deferred` while waiting.
+    fn finish_coming(&self) {
+        let Some((pos, coming)) = self.coming.lock().unwrap_or_else(|e| e.into_inner()).take()
+        else {
+            return;
+        };
+        let refreshes = coming.wait();
+        if refreshes.is_empty() {
+            return;
+        }
+        let mut deferred = self.deferred();
+        let at = pos.min(deferred.copies.len());
+        deferred.copies.splice(
+            at..at,
+            refreshes
+                .into_iter()
+                .map(|(shadow, from, to)| Step::Refresh(shadow, from as usize, (to - from) as usize)),
+        );
+    }
+
     pub(crate) fn close(&self) {
+        self.finish_coming();
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -6867,7 +6988,10 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
+        *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Releasing the last title resource can call the title's allocator.
+        let old = std::mem::take(&mut *self.deferred());
+        drop(old);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();

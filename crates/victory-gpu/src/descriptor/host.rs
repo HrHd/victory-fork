@@ -94,6 +94,98 @@ pub(crate) struct HostHeap {
     /// earlier submission was still on the card (`born_after > finished`):
     /// (slot, title handle, for_draw, born_after, required_before_submit).
     deferred_views: Mutex<Vec<(u32, u64, bool, u64, bool)>>,
+    /// The [`BufferPass`] state of the pass over the heap's buffer views
+    /// (frame it last ran in, its count, the ranges it refreshes).
+    pub(crate) buffer_pass: Mutex<BufferPass>,
+}
+
+/// Refresh ranges belong to the heap that owns the corresponding slots.
+#[derive(Default)]
+pub(crate) struct BufferPass {
+    pub(crate) frame: Option<u64>,
+    pub(crate) passes: u64,
+    pub(crate) ranges: BufferRanges,
+}
+
+/// The range of each descriptor slot and the union bounds for its host copy.
+/// A heap pass resolves the changed slots, then visits each host copy once.
+#[derive(Default)]
+pub(crate) struct BufferRanges {
+    slots: std::collections::HashMap<u32, (u64, u64, u64)>,
+    copies: std::collections::HashMap<u64, (std::sync::Arc<crate::shadow::Shadow>, Endpoints)>,
+}
+
+#[derive(Default)]
+struct Endpoints {
+    starts: std::collections::BTreeMap<u64, usize>,
+    ends: std::collections::BTreeMap<u64, usize>,
+}
+
+impl Endpoints {
+    fn insert(&mut self, from: u64, to: u64) {
+        *self.starts.entry(from).or_default() += 1;
+        *self.ends.entry(to).or_default() += 1;
+    }
+
+    fn remove(&mut self, from: u64, to: u64) {
+        for (map, key) in [(&mut self.starts, from), (&mut self.ends, to)] {
+            let std::collections::btree_map::Entry::Occupied(mut endpoint) = map.entry(key) else {
+                unreachable!("slot range has no cached endpoint");
+            };
+            *endpoint.get_mut() -= 1;
+            if *endpoint.get() == 0 {
+                endpoint.remove();
+            }
+        }
+    }
+
+    fn bounds(&self) -> Option<(u64, u64)> {
+        Some((*self.starts.first_key_value()?.0, *self.ends.last_key_value()?.0))
+    }
+}
+
+impl BufferRanges {
+    pub(crate) fn clear(&mut self) {
+        self.slots.clear();
+        self.copies.clear();
+    }
+
+    pub(crate) fn remove(&mut self, slot: u32) {
+        let Some((id, from, to)) = self.slots.remove(&slot) else { return };
+        let std::collections::hash_map::Entry::Occupied(mut copy) = self.copies.entry(id) else {
+            unreachable!("slot range has no cached host copy");
+        };
+        let endpoints = &mut copy.get_mut().1;
+        endpoints.remove(from, to);
+        if endpoints.starts.is_empty() {
+            copy.remove();
+        }
+    }
+
+    pub(crate) fn insert(&mut self, slot: u32, shadow: std::sync::Arc<crate::shadow::Shadow>, from: u64, to: u64) {
+        let range = (shadow.id(), from, to);
+        if self.slots.get(&slot) == Some(&range) {
+            return;
+        }
+        self.remove(slot);
+        let (_, endpoints) = self.copies.entry(range.0).or_insert_with(|| (shadow, Endpoints::default()));
+        endpoints.insert(from, to);
+        self.slots.insert(slot, range);
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub(crate) fn spans(&self) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+        self.copies
+            .values()
+            .filter_map(|(shadow, endpoints)| {
+                let (from, to) = endpoints.bounds()?;
+                Some((shadow.clone(), from, to))
+            })
+            .collect()
+    }
 }
 
 /// Counts of title-slot descriptor writes deferred because their host
@@ -1048,6 +1140,7 @@ impl HostHeap {
                 spans
             },
             deferred_views: Mutex::default(),
+            buffer_pass: Mutex::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no

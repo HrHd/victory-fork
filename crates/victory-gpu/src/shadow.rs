@@ -1634,6 +1634,51 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
 }
 
+/// Runs `f` over contiguous chunks of `items` on the persistent [`workers`]
+/// pool (plus this thread) and returns every chunk's result in order.
+#[allow(dead_code)]
+pub(crate) fn wide_each<T: Sync, R: Send, F: Fn(&[T]) -> R + Sync>(
+    items: &[T],
+    chunk_size: usize,
+    f: &F,
+) -> Vec<R> {
+    let chunk_size = chunk_size.max(1);
+    if items.len() <= chunk_size {
+        return if items.is_empty() {
+            Vec::new()
+        } else {
+            vec![f(items)]
+        };
+    }
+    let slices: Vec<&[T]> = items.chunks(chunk_size).collect();
+    let slots: Vec<std::sync::OnceLock<R>> = (0..slices.len())
+        .map(|_| std::sync::OnceLock::new())
+        .collect();
+    let f_addr = std::ptr::from_ref(f) as usize;
+    let jobs: Vec<Job> = slices
+        .into_iter()
+        .zip(slots.iter())
+        .map(|(slice, slot)| {
+            let slice_addr = slice.as_ptr() as usize;
+            let len = slice.len();
+            let slot_addr = std::ptr::from_ref(slot) as usize;
+            Box::new(move || {
+                // SAFETY: `wide` joins every job before `wide_each` returns, keeping
+                // `items`, `slots`, and `f` alive and writing disjoint `OnceLock` slots.
+                let slice = unsafe { std::slice::from_raw_parts(slice_addr as *const T, len) };
+                let func = unsafe { &*(f_addr as *const F) };
+                let out = unsafe { &*(slot_addr as *const std::sync::OnceLock<R>) };
+                let _ = out.set(func(slice));
+            }) as Job
+        })
+        .collect();
+    wide(jobs);
+    slots
+        .into_iter()
+        .filter_map(std::sync::OnceLock::into_inner)
+        .collect()
+}
+
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
 
@@ -2172,8 +2217,21 @@ fn changed_runs_bytes(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 /// differing 14 against 21; 12 of every 16 differing 24 against 34. (A form
 /// that compared 64 equal bytes and then walked eight at a time was slower
 /// than the walk in the last two, by a fifth: it never ran in a game.)
+///
+/// AVX2 is used where the CPU has it (32 bytes a compare instead of 16);
+/// SSE2, part of x86-64, is the fallback.
 #[cfg(target_arch = "x86_64")]
 fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 was found on this CPU above.
+        return unsafe { changed_runs_avx2(now, was) };
+    }
+    changed_runs_sse2(now, was)
+}
+
+/// [`changed_runs_wide`] 16 bytes a compare.
+#[cfg(target_arch = "x86_64")]
+fn changed_runs_sse2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
     let n = now.len().min(was.len());
     let (now, was) = (&now[..n], &was[..n]);
@@ -2243,6 +2301,55 @@ fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
+/// AVX2 byte-run comparison matching [`changed_runs_bytes`].
+///
+/// # Safety
+/// Caller must verify AVX2 is available on the current CPU.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::{_mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    let n = now.len().min(was.len());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut push = |from: usize, len: usize| match runs.last_mut() {
+        Some((a, prev)) if *a + *prev == from => *prev += len,
+        _ => runs.push((from, len)),
+    };
+    let mut i = 0;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n <= now.len()` and `was.len()`.
+        let same = unsafe {
+            _mm256_cmpeq_epi8(
+                _mm256_loadu_si256(now.as_ptr().add(i).cast()),
+                _mm256_loadu_si256(was.as_ptr().add(i).cast()),
+            )
+        };
+        let mut diff = !(_mm256_movemask_epi8(same) as u32);
+        while diff != 0 {
+            let first = diff.trailing_zeros();
+            let count = (diff >> first).trailing_ones();
+            push(i + first as usize, count as usize);
+            if first + count >= 32 {
+                break;
+            }
+            diff &= u32::MAX << (first + count);
+        }
+        i += 32;
+    }
+    while i < n {
+        if now[i] == was[i] {
+            i += 1;
+            continue;
+        }
+        let first = i;
+        while i < n && now[i] != was[i] {
+            i += 1;
+        }
+        push(first, i - first);
+    }
+    runs
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     changed_runs_bytes(now, was)
@@ -2250,7 +2357,7 @@ fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_chunks, changed_runs, changed_runs_bytes, changed_runs_wide};
+    use super::{PIECE, back_piece, changed_chunks, changed_runs, changed_runs_bytes, changed_runs_wide, wide_each};
 
     #[test]
     fn changed_chunks_hold_every_changed_byte() {
@@ -2456,6 +2563,53 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn changed_runs_avx2_matches_scalar() {
+        let mut seed = 13u32;
+        let mut next_u32 = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed
+        };
+        for round in 0..200 {
+            let len = match round {
+                0 => 0,
+                1 => 31,
+                2 => 32,
+                3 => 33,
+                4 => 64,
+                _ => (next_u32() as usize) % 500,
+            };
+            let was: Vec<u8> = (0..len).map(|_| (next_u32() >> 24) as u8).collect();
+            let mut now = was.clone();
+            if round == 4 {
+                now.fill(0x5a);
+            } else if len > 0 {
+                let edits = (next_u32() as usize) % (len + 1);
+                for _ in 0..edits {
+                    let at = (next_u32() as usize) % len;
+                    now[at] ^= ((next_u32() >> 16) as u8) | 1;
+                }
+            }
+            assert_eq!(changed_runs(&now, &was), changed_runs_bytes(&now, &was), "round {round} len {len}");
+        }
+    }
+
+    #[test]
+    fn wide_each_preserves_order_and_sums_chunks() {
+        let data: Vec<u64> = (1..=1000).collect();
+        let results = wide_each(&data, 77, &|chunk| (chunk[0], chunk.len(), chunk.iter().sum::<u64>()));
+        assert_eq!(results.len(), 13);
+        let mut expected_start = 1u64;
+        let mut total = 0u64;
+        for (first, count, sum) in results {
+            assert_eq!(first, expected_start);
+            expected_start += count as u64;
+            total += sum;
+        }
+        assert_eq!(expected_start, 1001);
+        assert_eq!(total, 1000 * 1001 / 2);
     }
 }
 

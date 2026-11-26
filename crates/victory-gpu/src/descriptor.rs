@@ -358,6 +358,19 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
+/// Runs `f` with a shared reference to the registered heap at `at` if it is
+/// still alive, holding a read lock on `SHADER_HEAPS`.
+#[cfg(windows)]
+pub(crate) fn with_heap<R>(at: usize, f: impl FnOnce(&Heap) -> R) -> Option<R> {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    if !heaps.iter().any(|&(_, _, h)| h == at) {
+        return None;
+    }
+    // SAFETY: registered heaps stay alive until `Heap::drop`, which acquires
+    // the `SHADER_HEAPS` write lock; we hold a read lock here.
+    Some(f(unsafe { &*(at as *const Heap) }))
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {

@@ -133,6 +133,10 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Microseconds of the pass over textures picked by index, inside the
+    /// pass over buffer views, and the buffer slots that pass looked at.
+    HeapViewResolveUs,
+    HeapBufferRefreshUs,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
