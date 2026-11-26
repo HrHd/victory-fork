@@ -1790,3 +1790,17 @@ pub(crate) fn light() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIGHT_REFRESH").is_none_or(|v| v != "0"))
 }
+
+pub(crate) fn landed_lately(at: usize, len: usize, frames: u64) -> bool {
+    let now = crate::frame::current();
+    (at / 4096..=(at + len.max(1) - 1) / 4096).any(|page| LANDED.since(page, now.saturating_sub(frames), now))
+}
+
+pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let g = guards();
+    (at / BLOCK..=(at + len - 1) / BLOCK)
+        .all(|b| !g.clean.contains(b) && !g.absent.contains(b) && !g.protected.contains(b))
+}

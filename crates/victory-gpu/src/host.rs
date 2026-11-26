@@ -10,6 +10,7 @@ use std::sync::{Mutex, OnceLock};
 
 #[cfg(windows)]
 mod stamps;
+mod card_steps;
 pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -1912,8 +1913,9 @@ enum Step {
     /// A copy into title memory (destination, source, bytes): the title's
     /// buffer copies, which later refreshes must see.
     Copy(usize, usize, usize),
-    /// A copy of title memory into the list's own upload memory.
-    Fill(usize, usize, usize),
+    /// A copy of title memory into the list's own upload memory, and how
+    /// the card could bring the bytes instead.
+    Fill(usize, usize, usize, Option<card_steps::FillTo>),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
     /// once per submission, whichever lists ask, until a `Copy` or `Run`
     /// intervenes.
@@ -2614,7 +2616,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         return Some(WHY_READ);
                     }
                 }
-                &Step::Fill(_, src, len) => {
+                &Step::Fill(_, src, len, None) => {
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
@@ -6682,7 +6684,7 @@ impl HostList {
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len));
+            .push(Step::Fill(dst as usize, src as usize, len, None));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -7049,7 +7051,7 @@ impl HostList {
                     crate::watch::wrote(dst, len);
                     len
                 }
-                &Step::Fill(dst, src, len) => {
+                &Step::Fill(dst, src, len, None) => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
@@ -9310,4 +9312,107 @@ impl Host {
         }
         self.send_late(lists, order, parts);
     }
+}
+
+fn refused(why: &'static str) {
+    *BLAMED.lock().unwrap_or_else(|e| e.into_inner()) = (None, why);
+}
+
+fn read_blocked(written: &[(usize, usize)], src: usize, len: usize) -> bool {
+    touches(written, src, src + len) && !fill_is_titles(src, len)
+}
+
+fn copy_blocked(written: &[(usize, usize)], dst: usize, src: usize, len: usize) -> Option<bool> {
+    let read = read_blocked(written, src, len);
+    (read || touches(written, dst, dst + len)).then_some(read)
+}
+
+#[derive(Default)]
+pub(crate) struct AddressHash(u64);
+
+impl std::hash::Hasher for AddressHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_usize(usize::from(b));
+        }
+    }
+    fn write_usize(&mut self, n: usize) {
+        let h = (self.0.rotate_left(5) ^ n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 32);
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.write_usize(n as usize);
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.write_usize(n as usize);
+    }
+}
+
+fn fill_is_titles(src: usize, len: usize) -> bool {
+    const SMALL: usize = 64 << 10;
+    static MODE: OnceLock<u32> = OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_FILL_TITLE").ok().as_deref() {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    });
+    #[cfg(feature = "diagnostics")]
+    let mode = crate::ab::pick("VICTORY_FILL_TITLE").map_or(mode, |on| if on { 2 } else { 0 });
+    if mode == 0 || len > SMALL {
+        return false;
+    }
+    !crate::watch::landed_lately(src, len, 600) || mode == 1 && crate::watch::written_since_taken(src, len)
+}
+
+type Blamed = (&'static str, &'static str, usize, usize, usize);
+
+fn blamed(why: usize, us: u64) {
+    let (named, refused) = std::mem::replace(&mut *BLAMED.lock().unwrap_or_else(|e| e.into_inner()), (None, ""));
+    let (key, at) = match (why, named) {
+        (WHY_READ | WHY_STALE, Some(named)) => named,
+        (WHY_READ, None) => (("a host copy of what a copy done on the card wrote", refused, 0, 0, 0), 0),
+        _ => {
+            let kind = match why {
+                WHY_SYNC => "a synchronous submission, a present or the sweep",
+                WHY_VALUE => "a memory value",
+                WHY_STALE => "title memory changed under shader writes",
+                WHY_RUN => "a step of ours",
+                WHY_MOST => "lists in the air",
+                WHY_FENCE => "a blocking fence wait",
+                _ => "another reason",
+            };
+            ((kind, "", 0, 0, 0), 0)
+        }
+    };
+    let mut all = BLAME.lock().unwrap_or_else(|e| e.into_inner());
+    let e = all.get_or_insert_with(Default::default).entry(key).or_default();
+    *e = (e.0 + 1, e.1 + us, at);
+}
+
+#[cfg(feature = "diagnostics")]
+
+pub(crate) type ByCopy<T> = std::collections::HashMap<usize, T, std::hash::BuildHasherDefault<AddressHash>>;
+
+static BLAME: Mutex<Option<std::collections::HashMap<Blamed, (u64, u64, usize)>>> = Mutex::new(None);
+static BLAMED: Mutex<(Option<(Blamed, usize)>, &'static str)> = Mutex::new((None, ""));
+type Run<T> = (Vec<T>, Vec<usize>);
+
+fn split<T>(lists: Vec<T>, order: Vec<usize>, cut: usize) -> Result<[Run<T>; 2], Run<T>> {
+    let (first, second) = order.split_at(cut);
+    if first.is_empty() || second.is_empty() || first.iter().any(|i| second.contains(i)) {
+        return Err((lists, order));
+    }
+    let behind: Vec<bool> = (0..lists.len()).map(|i| second.contains(&i)).collect();
+    let place = |i: usize| behind[..i].iter().filter(|&&b| b == behind[i]).count();
+    let orders = [first, second].map(|half| half.iter().map(|&i| place(i)).collect::<Vec<_>>());
+    let mut halves: [Vec<T>; 2] = [Vec::new(), Vec::new()];
+    for (list, behind) in lists.into_iter().zip(&behind) {
+        halves[usize::from(*behind)].push(list);
+    }
+    let [a, b] = halves;
+    let [x, y] = orders;
+    Ok([(a, x), (b, y)])
 }
